@@ -32,6 +32,7 @@ class FullDataModelGraph:
             fetch_fn,
             batch_size: Union[int, tf.Tensor],
             model_vars: ModelVars,
+            dtype
     ):
         dataset = tf.data.Dataset.from_tensor_slices(sample_indices)
 
@@ -56,12 +57,18 @@ class FullDataModelGraph:
 
         model = map_model(*fetch_fn(sample_indices))
 
+        zero = tf.zeros(shape=(), dtype=dtype)
+
         with tf.name_scope("log_likelihood"):
-            log_likelihood = op_utils.map_reduce(
-                last_elem=tf.gather(sample_indices, tf.size(sample_indices) - 1),
-                data=batched_data,
-                map_fn=lambda idx, data: map_model(idx, data).log_likelihood,
-                parallel_iterations=1,
+            # log_likelihood = op_utils.map_reduce(
+            #     last_elem=tf.gather(sample_indices, tf.size(sample_indices) - 1),
+            #     data=batched_data,
+            #     map_fn=lambda idx, data: map_model(idx, data).log_likelihood,
+            #     parallel_iterations=1,
+            # )
+            log_likelihood = batched_data.reduce(
+                initial_state=zero,
+                reduce_func=lambda old_state, input_elem: tf.add(old_state, map_model(*input_elem).log_likelihood),
             )
             norm_log_likelihood = log_likelihood / tf.cast(tf.size(sample_indices), dtype=log_likelihood.dtype)
             norm_neg_log_likelihood = - norm_log_likelihood
@@ -70,7 +77,7 @@ class FullDataModelGraph:
             loss = tf.reduce_sum(norm_neg_log_likelihood)
 
         with tf.name_scope("EM_update"):
-            def map_fn(idx, data):
+            def map_fn_EM(idx, data):
                 model = map_model(idx, data)
 
                 mixture_EM_update = tf.scatter_update(
@@ -83,11 +90,19 @@ class FullDataModelGraph:
                 with tf.control_dependencies([mixture_EM_update]):
                     return tf.identity(model.log_likelihood)
 
-            log_likelihood_EM = op_utils.map_reduce(
-                last_elem=tf.gather(sample_indices, tf.size(sample_indices) - 1),
-                data=batched_data,
-                map_fn=map_fn,
-                parallel_iterations=1,
+            def reduce_fn_EM(old_state, input_elem):
+                ll = map_fn_EM(*input_elem)
+                return tf.add(old_state, input_elem)
+
+            # log_likelihood_EM = op_utils.map_reduce(
+            #     last_elem=tf.gather(sample_indices, tf.size(sample_indices) - 1),
+            #     data=batched_data,
+            #     map_fn=map_fn,
+            #     parallel_iterations=1,
+            # )
+            log_likelihood_EM = batched_data.reduce(
+                initial_state=zero,
+                reduce_func=reduce_fn_EM,
             )
             norm_neg_log_likelihood_EM = - tf.div(
                 log_likelihood_EM,
@@ -96,6 +111,51 @@ class FullDataModelGraph:
 
             with tf.name_scope("loss"):
                 loss_EM = tf.reduce_sum(norm_neg_log_likelihood_EM)
+
+        with tf.name_scope("EM_update_with_gradient"):
+            def map_fn_EM_with_grad(idx, data):
+                model = map_model(idx, data)
+
+                mixture_EM_update = tf.scatter_update(
+                    ref=model_vars.mixture_logits_var,
+                    indices=idx,
+                    updates=tf.transpose(model.estimated_mixture_log_prob)
+                )
+
+                # perform mixture update and return resulting log-likelihood
+                with tf.control_dependencies([mixture_EM_update]):
+                    gradients = tf.gradients(
+                        [model_vars.a_var, model_vars.b_var],
+                        - model.log_likelihood
+                    )
+                    return tf.identity(model.log_likelihood), gradients,
+
+                    # log_likelihood_EM = op_utils.map_reduce(
+
+            def reduce_fn_EM_with_grad(prev, input_elem):
+                old_ll, old_grads = prev
+                cur_ll, cur_grads = map_fn_EM_with_grad(*input_elem)
+
+                return tf.add(old_ll, cur_ll), [
+                    tf.add(old_grad, cur_grad) for old_grad, cur_grad in zip(old_grads, cur_grads)
+                ]
+
+            log_likelihood_EM_with_grad, grads_EM_with_grads = batched_data.reduce(
+                initial_state=(zero, [zero, zero]),
+                reduce_func=reduce_fn_EM_with_grad,
+            )
+            divisor = tf.cast(tf.size(sample_indices), dtype=log_likelihood_EM_with_grad.dtype)
+
+            norm_neg_log_likelihood_EM_with_grad = - tf.div(
+                log_likelihood_EM_with_grad,
+                divisor
+            )
+            norm_grads_EM_with_grads = [
+                tf.div(grad, divisor) for grad in grads_EM_with_grads
+            ]
+
+            with tf.name_scope("loss"):
+                loss_EM_with_grad = tf.reduce_sum(norm_neg_log_likelihood_EM_with_grad)
 
         self.X = model.X
         self.design_loc = model.design_loc
@@ -126,6 +186,11 @@ class FullDataModelGraph:
 
         self.norm_neg_log_likelihood_EM = norm_neg_log_likelihood_EM
         self.loss_EM = loss_EM
+
+        self.norm_neg_log_likelihood_EM_with_grad = norm_neg_log_likelihood_EM_with_grad
+        self.loss_EM_with_grad = loss_EM_with_grad
+        self.grads_EM_with_grads = grads_EM_with_grads
+        self.norm_grads_EM_with_grads = norm_grads_EM_with_grads
 
 
 def _normalize_mixture_weights(weights):
@@ -286,6 +351,7 @@ class EstimatorGraph(TFEstimatorGraph):
                     fetch_fn=fetch_fn,
                     batch_size=batch_size * buffer_size,
                     model_vars=model_vars,
+                    dtype=dtype
                 )
                 full_data_loss = full_data_model.loss
 
